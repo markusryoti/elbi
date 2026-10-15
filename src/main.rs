@@ -1,52 +1,34 @@
 use std::{
-    io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
+    thread,
 };
 
 use tracing::{error, info};
 
-const MAX_DATA: usize = 4096;
-const BUF_SIZE: usize = 1024;
-
-fn get_connection() -> Result<TcpStream, Box<dyn std::error::Error>> {
-    let stream = TcpStream::connect("127.0.0.1:8080")?;
+fn get_connection(addr: &str) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let stream = TcpStream::connect(addr)?;
     Ok(stream)
 }
 
-fn handle_sock(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
-    let mut bytes: Vec<u8> = vec![];
+fn handle_sock(mut client: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let mut backend = get_connection("127.0.0.1:8080")?;
 
-    let mut conn = get_connection()?;
+    let mut client_reader = client.try_clone()?;
+    let mut backend_writer = backend.try_clone()?;
 
-    let mut read_bytes = 0;
-    while read_bytes < MAX_DATA {
-        let mut buf = vec![0; BUF_SIZE];
-        let n_bytes = stream.read(&mut buf)?;
+    let client_to_backend = thread::spawn(move || -> std::io::Result<()> {
+        std::io::copy(&mut client_reader, &mut backend_writer)?;
+        backend_writer.shutdown(Shutdown::Write)?;
+        Ok(())
+    });
 
-        if n_bytes == 0 {
-            info!("No more bytes was read");
-            break;
-        }
+    std::io::copy(&mut backend, &mut client)?;
 
-        bytes.append(&mut buf[..n_bytes].to_vec());
-        read_bytes += n_bytes;
+    client.shutdown(Shutdown::Write)?;
 
-        conn.write_all(&buf[..n_bytes]).unwrap();
-
-        info!("Current buf: {}", String::from_utf8(buf)?);
-    }
-
-    conn.shutdown(Shutdown::Write)?;
-    info!("Shutdown backend write");
-
-    let mut res_buf = vec![];
-    conn.read_to_end(&mut res_buf).unwrap();
-    info!("Read result buf");
-
-    stream.write_all(&res_buf)?;
-    info!("Response buf:\n{}", String::from_utf8(res_buf)?);
-
-    stream.shutdown(Shutdown::Write)?;
+    client_to_backend
+        .join()
+        .map_err(|_| std::io::Error::other("forwarding thread panic"))??;
 
     Ok(())
 }
