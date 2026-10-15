@@ -11,16 +11,15 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new() -> Self {
-        let backends: Vec<String> =
-            vec!["127.0.0.1:8080".to_string(), "127.0.0.1:8081".to_string()];
-        let server_pool = ServerPool::new(backends);
-
-        Server { server_pool }
+    pub fn new(servers: Vec<String>) -> Self {
+        Server {
+            server_pool: ServerPool::new(servers),
+        }
     }
 
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+
         info!("Listener binded to a port");
 
         for stream in listener.incoming() {
@@ -30,12 +29,6 @@ impl Server {
         }
 
         Ok(())
-    }
-}
-
-impl Default for Server {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -52,6 +45,8 @@ impl ServerPool {
         }
     }
 
+    /// Does simple round robin
+    ///
     fn get_connection(&self) -> Result<TcpStream, Box<dyn std::error::Error>> {
         let addr = if let Ok(mut curr) = self.current.lock() {
             *curr = (*curr + 1) % self.servers.len();
@@ -61,8 +56,8 @@ impl ServerPool {
         };
 
         let addr = addr.ok_or(std::io::Error::other("mutex error"))?;
-
         let stream = TcpStream::connect(addr)?;
+
         Ok(stream)
     }
 }
