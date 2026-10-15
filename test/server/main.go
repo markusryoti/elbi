@@ -21,7 +21,11 @@ func main() {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		logger.Info("got connection")
 		w.Write([]byte("hello world"))
-		logger.Info("wrote result")
+	})
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		logger.Info("healthcheck", "status", "ok")
+		w.WriteHeader(http.StatusOK)
 	})
 
 	logger.Info("starting server", "port", port)

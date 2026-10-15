@@ -1,7 +1,11 @@
+use futures::future::join_all;
+use tokio::time::{self, MissedTickBehavior};
+
 use std::{
     net::{Shutdown, TcpListener, TcpStream},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
+    time::Duration,
 };
 
 use tracing::{error, info};
@@ -19,8 +23,9 @@ impl Server {
 
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
-
         info!("Listener binded to a port");
+
+        self.server_pool.start_background();
 
         for stream in listener.incoming() {
             let stream = stream.inspect_err(|e| error!("{}", e)).unwrap();
@@ -33,14 +38,14 @@ impl Server {
 }
 
 struct ServerPool {
-    servers: Vec<String>,
+    servers: Arc<Vec<String>>,
     current: Mutex<usize>,
 }
 
 impl ServerPool {
     fn new(servers: Vec<String>) -> Self {
         ServerPool {
-            servers,
+            servers: Arc::new(servers),
             current: Mutex::new(0),
         }
     }
@@ -60,6 +65,50 @@ impl ServerPool {
 
         Ok(stream)
     }
+
+    fn start_background(&self) {
+        let servers = Arc::clone(&self.servers);
+        tokio::spawn(async move { background_job(servers).await });
+    }
+}
+
+async fn background_job(servers: Arc<Vec<String>>) {
+    let mut ticker = time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+
+        info!("Calling for server healthchecks");
+
+        let failed_servers = run_healthchecks(&servers).await;
+
+        info!("Failed servers: {:?}", failed_servers);
+    }
+}
+
+async fn run_healthchecks(servers: &Arc<Vec<String>>) -> Vec<String> {
+    let checks = servers.iter().map(async |s| {
+        let r = backend_ok(s).await;
+        (s, r)
+    });
+
+    let failed: Vec<_> = join_all(checks)
+        .await
+        .into_iter()
+        .filter_map(|(addr, res)| {
+            let res = res.unwrap_or(false);
+            if !res { Some(addr.clone()) } else { None }
+        })
+        .collect();
+
+    failed
+}
+
+async fn backend_ok(addr: &str) -> Result<bool, reqwest::Error> {
+    let res = reqwest::get(format!("http://{}/health", addr)).await?;
+    let ok = res.status().is_success();
+    Ok(ok)
 }
 
 fn handle_sock(
