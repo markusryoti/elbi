@@ -1,13 +1,11 @@
 use futures::future::join_all;
-use tokio::time::{self, MissedTickBehavior};
-
 use std::{
     net::{Shutdown, TcpListener, TcpStream},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
-
+use tokio::time::{self, MissedTickBehavior};
 use tracing::{error, info};
 
 pub struct Server {
@@ -38,14 +36,17 @@ impl Server {
 }
 
 struct ServerPool {
-    servers: Arc<Vec<String>>,
+    all_servers: Arc<Vec<String>>,
+    passing_servers: Arc<Mutex<Vec<String>>>,
     current: Mutex<usize>,
 }
 
 impl ServerPool {
     fn new(servers: Vec<String>) -> Self {
+        let cloned = servers.clone();
         ServerPool {
-            servers: Arc::new(servers),
+            all_servers: Arc::new(servers),
+            passing_servers: Arc::new(Mutex::new(cloned)),
             current: Mutex::new(0),
         }
     }
@@ -54,8 +55,12 @@ impl ServerPool {
     ///
     fn get_connection(&self) -> Result<TcpStream, Box<dyn std::error::Error>> {
         let addr = if let Ok(mut curr) = self.current.lock() {
-            *curr = (*curr + 1) % self.servers.len();
-            self.servers.get(*curr)
+            if let Ok(servers) = self.passing_servers.lock() {
+                *curr = (*curr + 1) % servers.len();
+                servers.get(*curr).cloned()
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -67,12 +72,13 @@ impl ServerPool {
     }
 
     fn start_background(&self) {
-        let servers = Arc::clone(&self.servers);
-        tokio::spawn(async move { background_job(servers).await });
+        let all_servers = Arc::clone(&self.all_servers);
+        let ok_servers = Arc::clone(&self.passing_servers);
+        tokio::spawn(async move { background_job(all_servers, ok_servers).await });
     }
 }
 
-async fn background_job(servers: Arc<Vec<String>>) {
+async fn background_job(servers: Arc<Vec<String>>, passing_servers: Arc<Mutex<Vec<String>>>) {
     let mut ticker = time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -81,9 +87,14 @@ async fn background_job(servers: Arc<Vec<String>>) {
 
         info!("Calling for server healthchecks");
 
-        let failed_servers = run_healthchecks(&servers).await;
+        let ok_servers = run_healthchecks(&servers).await;
 
-        info!("Failed servers: {:?}", failed_servers);
+        if let Ok(mut ps) = passing_servers.lock() {
+            ps.clear();
+            ok_servers.into_iter().for_each(|s| ps.push(s));
+        }
+
+        info!("Passing servers updated: {:?}", passing_servers);
     }
 }
 
@@ -93,16 +104,16 @@ async fn run_healthchecks(servers: &Arc<Vec<String>>) -> Vec<String> {
         (s, r)
     });
 
-    let failed: Vec<_> = join_all(checks)
+    let ok_servers: Vec<_> = join_all(checks)
         .await
         .into_iter()
         .filter_map(|(addr, res)| {
             let res = res.unwrap_or(false);
-            if !res { Some(addr.clone()) } else { None }
+            if res { Some(addr.clone()) } else { None }
         })
         .collect();
 
-    failed
+    ok_servers
 }
 
 async fn backend_ok(addr: &str) -> Result<bool, reqwest::Error> {
