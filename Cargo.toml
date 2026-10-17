@@ -12,4 +12,5 @@ futures = "0.3.34"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1.28.0", features = [ "v4"] }
 socket2 = "0.6.5"
+tokio-util = "0.7.20"
 

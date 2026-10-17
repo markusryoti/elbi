@@ -1,25 +1,30 @@
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::{
+        Arc,
+        mpsc::{self, RecvTimeoutError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use tracing::{Level, error, info, span};
 use uuid::Uuid;
 
-use crate::server_pool::ServerPool;
+use crate::{server_pool::ServerPool, thread_pool::ThreadPool};
 
 pub struct LoadBalancer {
     addr: String,
-    server_pool: ServerPool,
+    server_pool: Arc<ServerPool>,
+    thread_pool: ThreadPool,
 }
 
 impl LoadBalancer {
     pub fn new(addr: String, servers: Vec<String>) -> Self {
         LoadBalancer {
             addr,
-            server_pool: ServerPool::new(servers),
+            server_pool: Arc::new(ServerPool::new(servers)),
+            thread_pool: ThreadPool::new(4),
         }
     }
 
@@ -41,34 +46,45 @@ impl LoadBalancer {
             let span = span!(Level::INFO, "client_request", corr_id = id);
             let _guard = span.enter();
 
-            let stream = match stream {
-                Ok(s) => s,
-                Err(e) => {
+            let server_pool = Arc::clone(&self.server_pool);
+
+            let job = move || {
+                let stream = match stream {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("connection failed: {e}");
+                        return;
+                    }
+                };
+
+                info!("Grabbing a connection for client request");
+
+                let backend = match server_pool.get_connection() {
+                    Ok(backend) => backend,
+                    Err(e) => {
+                        error!("connection failed: {e}");
+                        return;
+                    }
+                };
+
+                let peer_addr: String = match backend.peer_addr() {
+                    Ok(add) => add.to_string(),
+                    Err(_) => "unknown".into(),
+                };
+
+                info!(
+                    addr = peer_addr,
+                    "Got connection for handling client request",
+                );
+
+                let deadline = Instant::now() + Duration::from_secs(5);
+
+                if let Err(e) = handle_sock(stream, backend, deadline) {
                     error!("connection failed: {e}");
-                    continue;
                 }
             };
 
-            info!("Grabbing a connection for client request");
-
-            let backend = match self.server_pool.get_connection() {
-                Ok(backend) => backend,
-                Err(e) => {
-                    error!("connection failed: {e}");
-                    continue;
-                }
-            };
-
-            info!(
-                addr = backend.peer_addr()?.to_string(),
-                "Got connection for handling client request",
-            );
-
-            let deadline = Instant::now() + Duration::from_secs(5);
-
-            if let Err(e) = handle_sock(stream, backend, deadline) {
-                error!("connection failed: {e}");
-            }
+            self.thread_pool.enqueue(Box::new(job))?;
         }
 
         Ok(())

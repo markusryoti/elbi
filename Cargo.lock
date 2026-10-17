@@ -176,6 +176,7 @@ dependencies = [
  "reqwest",
  "socket2",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
