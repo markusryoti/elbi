@@ -1,5 +1,6 @@
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    net::{Shutdown, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::mpsc::{self, RecvTimeoutError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -23,8 +24,15 @@ impl LoadBalancer {
     }
 
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind(&self.addr).unwrap();
-        info!("Listener binded to a port");
+        let addr: SocketAddr = self.addr.parse().unwrap();
+
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        socket.bind(&addr.into())?;
+        socket.listen(16)?;
+
+        let listener: TcpListener = socket.into();
+
+        info!("Listener binded to an address");
 
         self.server_pool.start_background();
 
