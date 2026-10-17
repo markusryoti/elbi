@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::{self, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub struct ServerPool {
@@ -43,19 +44,29 @@ impl ServerPool {
         Ok(stream)
     }
 
-    pub fn start_background(&self) {
+    pub fn start_background(&self, shutdown: CancellationToken) {
         let all_servers = Arc::clone(&self.all_servers);
         let ok_servers = Arc::clone(&self.passing_servers);
-        tokio::spawn(async move { background_job(all_servers, ok_servers).await });
+        tokio::spawn(async move { background_job(all_servers, ok_servers, shutdown).await });
     }
 }
 
-async fn background_job(servers: Arc<Vec<String>>, passing_servers: Arc<Mutex<Vec<String>>>) {
+async fn background_job(
+    servers: Arc<Vec<String>>,
+    passing_servers: Arc<Mutex<Vec<String>>>,
+    shutdown: CancellationToken,
+) {
     let mut ticker = time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("Stopping server healthchecks");
+                return;
+            }
+            _ = ticker.tick() => {}
+        }
 
         info!("Calling for server healthchecks");
 

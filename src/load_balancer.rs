@@ -8,6 +8,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{Level, error, info, span};
 use uuid::Uuid;
 
@@ -28,10 +29,11 @@ impl LoadBalancer {
         }
     }
 
-    pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn run(self, shutdown: CancellationToken) -> Result<(), Box<dyn std::error::Error>> {
         let addr: SocketAddr = self.addr.parse().unwrap();
 
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
         socket.bind(&addr.into())?;
         socket.listen(16)?;
 
@@ -39,9 +41,19 @@ impl LoadBalancer {
 
         info!("Listener binded to an address");
 
-        self.server_pool.start_background();
+        self.server_pool.start_background(shutdown.clone());
+
+        let wake_token = shutdown.clone();
+        tokio::spawn(async move {
+            wake_token.cancelled().await;
+            let _ = tokio::net::TcpStream::connect(addr).await;
+        });
 
         for stream in listener.incoming() {
+            if shutdown.is_cancelled() {
+                break;
+            }
+
             let id = Uuid::new_v4().to_string();
             let span = span!(Level::INFO, "client_request", corr_id = id);
             let _guard = span.enter();
@@ -86,6 +98,11 @@ impl LoadBalancer {
 
             self.thread_pool.enqueue(Box::new(job))?;
         }
+
+        info!("Stopped accepting connections, draining");
+
+        drop(listener);
+        drop(self.thread_pool);
 
         Ok(())
     }

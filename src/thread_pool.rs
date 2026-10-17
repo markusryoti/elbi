@@ -10,14 +10,14 @@ use tracing::info;
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    tx: Sender<Job>,
+    tx: Option<Sender<Job>>,
 }
 
 type Job = Box<dyn FnOnce() + Send>;
 
 struct Worker {
     id: usize,
-    handle: JoinHandle<Job>,
+    handle: JoinHandle<()>,
 }
 
 impl Worker {
@@ -32,10 +32,10 @@ impl Worker {
                     None
                 };
 
-                if let Some(job) = job {
-                    info!("Worker: {} handling job", id);
-                    job();
-                }
+                let Some(job) = job else { break };
+
+                info!("Worker: {} handling job", id);
+                job();
             }
         });
 
@@ -52,21 +52,28 @@ impl ThreadPool {
             .map(|i| Worker::new(i, Arc::clone(&rx)))
             .collect();
 
-        ThreadPool { workers, tx }
+        ThreadPool {
+            workers,
+            tx: Some(tx),
+        }
     }
 
     pub fn enqueue(&self, job: Job) -> Result<(), SendError<Job>> {
-        self.tx.send(job)?;
-        Ok(())
+        match &self.tx {
+            Some(tx) => tx.send(job),
+            None => Err(SendError(job)),
+        }
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
+        drop(self.tx.take());
+
         for worker in self.workers.drain(..) {
             info!("Shutting down worker {}", worker.id);
 
-            let _ = worker.handle.join().unwrap();
+            let _ = worker.handle.join();
         }
     }
 }
