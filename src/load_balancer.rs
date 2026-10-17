@@ -1,6 +1,8 @@
 use std::{
     net::{Shutdown, TcpListener, TcpStream},
+    sync::mpsc::{self, RecvTimeoutError},
     thread,
+    time::{Duration, Instant},
 };
 use tracing::{Level, error, info, span};
 use uuid::Uuid;
@@ -8,18 +10,20 @@ use uuid::Uuid;
 use crate::server_pool::ServerPool;
 
 pub struct LoadBalancer {
+    addr: String,
     server_pool: ServerPool,
 }
 
 impl LoadBalancer {
-    pub fn new(servers: Vec<String>) -> Self {
+    pub fn new(addr: String, servers: Vec<String>) -> Self {
         LoadBalancer {
+            addr,
             server_pool: ServerPool::new(servers),
         }
     }
 
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+        let listener = TcpListener::bind(&self.addr).unwrap();
         info!("Listener binded to a port");
 
         self.server_pool.start_background();
@@ -29,9 +33,12 @@ impl LoadBalancer {
             let span = span!(Level::INFO, "client_request", corr_id = id);
             let _guard = span.enter();
 
+            let deadline = Instant::now() + Duration::from_secs(5);
+
             info!("Grabbing a connection for client request");
 
             let stream = stream.inspect_err(|e| error!("{}", e))?;
+
             let backend = self.server_pool.get_connection()?;
 
             info!(
@@ -39,7 +46,9 @@ impl LoadBalancer {
                 "Got connection for handling client request",
             );
 
-            handle_sock(stream, backend)?;
+            if let Err(e) = handle_sock(stream, backend, deadline) {
+                error!("connection failed: {e}");
+            }
         }
 
         Ok(())
@@ -49,11 +58,26 @@ impl LoadBalancer {
 fn handle_sock(
     mut client: TcpStream,
     mut backend: TcpStream,
+    deadline: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Handling client request");
 
     let mut client_reader = client.try_clone()?;
     let mut backend_writer = backend.try_clone()?;
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (c, b) = (client.try_clone()?, backend.try_clone()?);
+
+    let watchdog = thread::spawn(move || {
+        match done_rx.recv_timeout(deadline - Instant::now()) {
+            Err(RecvTimeoutError::Timeout) => {
+                // deadline hit: kill both sockets
+                let _ = c.shutdown(Shutdown::Both);
+                let _ = b.shutdown(Shutdown::Both);
+            }
+            _ => {} // Disconnected (or a message) = finished normally
+        }
+    });
 
     let writer_span = span!(Level::INFO, "backend_writer");
 
@@ -75,6 +99,9 @@ fn handle_sock(
     client_to_backend
         .join()
         .map_err(|_| std::io::Error::other("forwarding thread panic"))??;
+
+    drop(done_tx);
+    let _ = watchdog.join();
 
     info!("Handled client request");
 
